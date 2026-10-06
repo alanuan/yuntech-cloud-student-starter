@@ -42,7 +42,17 @@ case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) echo "Note: Windows file system, POSIX mode check skipped; $SECRET relies on your profile ACL." ;;
     *) [ "$(stat -c '%a' "$SECRET")" = 600 ] || stop "$SECRET must be mode 600" ;;
 esac
-SECRET_LINES=$(tr -d '\r' < "$SECRET" | sed '/^$/d')
+# W5: the database settings written by db-up.sh travel in the same secret file.
+DB_SECRET=.local/db.env
+if [ -f "$DB_SECRET" ]; then
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *) [ "$(stat -c '%a' "$DB_SECRET")" = 600 ] || stop "$DB_SECRET must be mode 600" ;;
+    esac
+    SECRET_LINES=$(cat "$SECRET" "$DB_SECRET" | tr -d '\r' | sed '/^$/d')
+else
+    SECRET_LINES=$(tr -d '\r' < "$SECRET" | sed '/^$/d')
+fi
 if grep -qvE '^[A-Z][A-Z0-9_]*=[^[:space:]]+$' <<<"$SECRET_LINES"; then stop "$SECRET has a line that is not KEY=VALUE"; fi
 for name in REPORTER_TOKEN OPERATOR_TOKEN; do
     grep -qE "^$name=.{20,}$" <<<"$SECRET_LINES" || stop "$SECRET lacks $name"
@@ -82,16 +92,19 @@ REMOTE='sudo bash -c '\''umask 077; f=$(mktemp) && cat > $f && bash $f; rc=$?; r
         "ec2-user@$HOST" "$REMOTE" >/dev/null
 echo "Installer finished; checking /health"
 
-# 3. Read back: the version must be this commit and the tokens must be loaded.
+# 3. Read back: the version must be this commit and the secrets must be loaded.
+WANT_DB=false
+if grep -qE '^DB_HOST=.+$' <<<"$SECRET_LINES"; then WANT_DB=true; fi
 for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if curl --silent --max-time 8 "http://$HOST/health" | "$PY" -c '
 import json, sys
 body = json.load(sys.stdin)
-sys.exit(0 if body.get("version") == sys.argv[1] and body.get("auth_configured") is True else 1)' "$SHA" 2>/dev/null
+ok = body.get("version") == sys.argv[1] and body.get("auth_configured") is True
+sys.exit(0 if ok and body.get("db_configured", False) is (sys.argv[2] == "true") else 1)' "$SHA" "$WANT_DB" 2>/dev/null
     then
-        echo "OK: http://$HOST/health reports version $SHA and auth_configured=true"
+        echo "OK: http://$HOST/health reports version $SHA, auth_configured=true, db_configured=$WANT_DB"
         exit 0
     fi
     sleep 5
 done
-stop "/health did not report version $SHA with auth_configured=true within 60 s"
+stop "/health did not report version $SHA with auth_configured=true and db_configured=$WANT_DB within 60 s"

@@ -90,11 +90,20 @@ class EventContract(unittest.TestCase):
         self.assertEqual(self.call_json("GET", "/events", REPORTER)[0], 403)
         self.assertEqual(self.call_json("GET", "/events/x", REPORTER)[0], 403)
 
-    def test_duplicate_event_id_is_conflict(self):
+    def test_resend_is_idempotent_and_changed_content_conflicts(self):
+        """W5 rules: same id and content -> 200 with nothing added; same id, other content -> 409."""
         event = fixture("event_valid.json")
-        self.assertEqual(self.call_json("POST", "/events", REPORTER, event)[0], 201)
-        status, body = self.call_json("POST", "/events", REPORTER, event)
+        status, created = self.call_json("POST", "/events", REPORTER, event)
+        self.assertEqual(status, 201)
+        self.assertEqual(self.call_json("POST", "/events", REPORTER, event), (200, created))
+        status, body = self.call_json("POST", "/events", REPORTER, dict(event, note="changed"))
         self.assertEqual((status, body["field"]), (409, "event_id"))
+        without_note = {k: v for k, v in event.items() if k != "note"}
+        self.assertEqual(self.call_json("POST", "/events", REPORTER, without_note)[0], 409)
+        self.assertEqual(self.call_json("GET", "/events", OPERATOR)[1]["events"], [created])
+
+    def test_health_reports_no_database_offline(self):
+        self.assertIs(self.call_json("GET", "/health")[1]["db_configured"], False)
 
     def test_field_rules(self):
         good = fixture("event_valid.json")
