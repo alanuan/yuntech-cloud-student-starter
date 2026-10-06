@@ -1,0 +1,7 @@
+{
+  "event_id": "g01-m1-0001",
+  "device_id": "g01-d01",
+  "observed_at": "2026-10-06T10:00:00+08:00",
+  "type": "status",
+  "note": "routine check, all normal"
+}
