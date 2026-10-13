@@ -99,8 +99,11 @@ trap 'rm -f "$INSTALLER"' EXIT
 #    user data or Git. The host keeps them in a root-only temporary file while it runs.
 REMOTE='sudo bash -c '\''umask 077; f=$(mktemp) && cat > $f && bash $f; rc=$?; rm -f $f; exit $rc'\'''
 {
+    # The session's umask 077 protects the secrets below, but the installer's files (the vendored MQTT
+    # library above all) must stay readable by the inspection user.
+    printf '%s\n' 'umask 022'
     cat "$INSTALLER"
-    printf '\n%s\n' 'install -d -m 755 /etc/inspection' 'umask 077'
+    printf '\n%s\n' 'chmod -R go+rX /opt/inspection/vendor' 'install -d -m 755 /etc/inspection' 'umask 077'
     if $WANT_IOT; then
         # The consumer runs as inspection: files owned by root would be unreadable and it would restart forever.
         printf '%s\n' "install -d -o inspection -g inspection -m 700 $IOT_REMOTE"
