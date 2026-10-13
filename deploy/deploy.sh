@@ -2,6 +2,7 @@
 # Deploy ONE committed version to the existing host over SSH, then install the secret file.
 # Spec: labs/04-web-api/README.md ("權杖與 deploy.sh"). Runs in Codespaces bash and Git Bash on Windows.
 #
+# W6 (labs/06-iot/README.md, "規格 E"): also places the consumer's certificate, private key and Root CA.
 # Reads (never prints) .local/app.env. Settings come from .local/config.env:
 #   LAB_PROFILE (default learnerlab), LAB_REGION (default us-east-1), SSH_KEY (private key path),
 #   SSH_BIN (default ssh), PYTHON (optional interpreter path). The host is the instance_id recorded in .local/resources.json.
@@ -53,6 +54,22 @@ if [ -f "$DB_SECRET" ]; then
 else
     SECRET_LINES=$(tr -d '\r' < "$SECRET" | sed '/^$/d')
 fi
+# W6: once iot-up.sh has run, the consumer's settings join the secret file and its three files are sent too.
+IOT_DIR=.local/iot
+IOT_REMOTE=/etc/inspection/iot
+IOT_FILES="AmazonRootCA1.pem consumer.cert.pem consumer.private.key"
+WANT_IOT=false
+if [ -f "$IOT_DIR/consumer.private.key" ]; then
+    WANT_IOT=true
+    for name in endpoint $IOT_FILES; do [ -s "$IOT_DIR/$name" ] || stop "missing $IOT_DIR/$name; rerun deploy/iot-up.sh"; done
+    CODE=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["iot_consumer_policy"][4:-9])' "$RESOURCES" | tr -d '\r')
+    [[ "$CODE" =~ ^[a-z0-9]+-[a-z0-9]+$ ]] || stop "iot_consumer_policy in $RESOURCES is not cxe-<code>-consumer"
+    DEVICES=$(for n in 01 02 03 04 05 06 07 08 09 10; do printf '%s-d%s,' "$CODE" "$n"; done)
+    SECRET_LINES=$(printf '%s\n' "$SECRET_LINES" \
+        "IOT_ENDPOINT=$(tr -d '\r\n' < "$IOT_DIR/endpoint")" "IOT_TOPIC=cxe/$CODE/gw/events" \
+        "IOT_CLIENT_ID=consumer-$CODE" "IOT_DEVICE_IDS=${DEVICES%,}" "IOT_CA=$IOT_REMOTE/AmazonRootCA1.pem" \
+        "IOT_CERT=$IOT_REMOTE/consumer.cert.pem" "IOT_KEY=$IOT_REMOTE/consumer.private.key")
+fi
 if grep -qvE '^[A-Z][A-Z0-9_]*=[^[:space:]]+$' <<<"$SECRET_LINES"; then stop "$SECRET has a line that is not KEY=VALUE"; fi
 for name in REPORTER_TOKEN OPERATOR_TOKEN; do
     grep -qE "^$name=.{20,}$" <<<"$SECRET_LINES" || stop "$SECRET lacks $name"
@@ -70,6 +87,7 @@ read -r STATE HOST <<<"$INFO"
 echo "Target host : $INSTANCE at $HOST (profile $LAB_PROFILE, $LAB_REGION)"
 echo "Commit      : $SHA"
 echo "Actions     : run the packaged installer, replace /etc/inspection/app.env (root, 600), restart inspection"
+if $WANT_IOT; then echo "              place 3 consumer files in $IOT_REMOTE (inspection, 600), restart inspection-consumer"; fi
 read -r -p "Type deploy to continue: " answer
 [ "$answer" = deploy ] || stop "cancelled; nothing was changed"
 
@@ -82,12 +100,22 @@ trap 'rm -f "$INSTALLER"' EXIT
 REMOTE='sudo bash -c '\''umask 077; f=$(mktemp) && cat > $f && bash $f; rc=$?; rm -f $f; exit $rc'\'''
 {
     cat "$INSTALLER"
-    printf '\n%s\n' 'install -d -m 755 /etc/inspection' 'umask 077' \
-        "cat > /etc/inspection/app.env.new <<'APP_ENV_END'"
+    printf '\n%s\n' 'install -d -m 755 /etc/inspection' 'umask 077'
+    if $WANT_IOT; then
+        # The consumer runs as inspection: files owned by root would be unreadable and it would restart forever.
+        printf '%s\n' "install -d -o inspection -g inspection -m 700 $IOT_REMOTE"
+        for name in $IOT_FILES; do
+            printf '%s\n' "cat > $IOT_REMOTE/$name <<'IOT_FILE_END'"
+            tr -d '\r' < "$IOT_DIR/$name" | sed '/^$/d'
+            printf '%s\n' 'IOT_FILE_END' "chown inspection:inspection $IOT_REMOTE/$name" "chmod 600 $IOT_REMOTE/$name"
+        done
+    fi
+    printf '%s\n' "cat > /etc/inspection/app.env.new <<'APP_ENV_END'"
     printf '%s\n' "$SECRET_LINES"
     printf '%s\n' 'APP_ENV_END' 'chown root:root /etc/inspection/app.env.new' \
         'chmod 600 /etc/inspection/app.env.new' 'mv -f /etc/inspection/app.env.new /etc/inspection/app.env' \
         'systemctl restart inspection'
+    if $WANT_IOT; then printf '%s\n' 'systemctl restart inspection-consumer'; fi
 } | MSYS_NO_PATHCONV=1 "$SSH_BIN" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
         "ec2-user@$HOST" "$REMOTE" >/dev/null
 echo "Installer finished; checking /health"
@@ -103,6 +131,12 @@ ok = body.get("version") == sys.argv[1] and body.get("auth_configured") is True
 sys.exit(0 if ok and body.get("db_configured", False) is (sys.argv[2] == "true") else 1)' "$SHA" "$WANT_DB" 2>/dev/null
     then
         echo "OK: http://$HOST/health reports version $SHA, auth_configured=true, db_configured=$WANT_DB"
+        if $WANT_IOT; then
+            sleep 5  # a consumer that cannot start shows as activating or failed only after its first exit
+            "$SSH_BIN" -i "$SSH_KEY" -o ConnectTimeout=15 -o LogLevel=ERROR "ec2-user@$HOST" \
+                'systemctl is-active inspection inspection-consumer' \
+                || stop "a service is not active; see sudo journalctl -u inspection-consumer -n 30"
+        fi
         exit 0
     fi
     sleep 5

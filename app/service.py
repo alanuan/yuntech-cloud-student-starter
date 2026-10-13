@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspection service: W3 health check, W4 event API and display page, W5 PostgreSQL storage."""
+"""Inspection service: W3 health check, W4 event API and display page, W5 PostgreSQL storage, W6 device filter."""
 from datetime import datetime, timezone
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sys
 import threading
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 RDS_CA = "/etc/inspection/rds-ca.pem"
 MAX_BODY = 4 * 1024
@@ -37,6 +37,7 @@ th, td { border: 1px solid #999; padding: .3rem .5rem; text-align: left; }
 <body>
 <h1>巡檢事件</h1>
 <label>operator 權杖 <input id="token" type="password" autocomplete="off" size="48"></label>
+<label>設備編號 <input id="device" type="text" autocomplete="off" size="20"></label>
 <button id="load" type="button">讀取</button>
 <button id="clear" type="button">清空權杖</button>
 <span id="state"></span>
@@ -53,10 +54,12 @@ const rows = document.getElementById("rows");
 document.getElementById("clear").addEventListener("click", () => { tokenBox.value = ""; });
 document.getElementById("load").addEventListener("click", async () => {
   const token = tokenBox.value;  // kept in this variable only: never in the URL or browser storage
+  const device = document.getElementById("device").value.trim();
+  const url = "/events" + (device ? "?device_id=" + encodeURIComponent(device) : "");
   rows.replaceChildren();
   state.textContent = "讀取中";
   try {
-    const response = await fetch("/events", { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
+    const response = await fetch(url, { headers: { Authorization: "Bearer " + token }, cache: "no-store" });
     const body = await response.json();
     if (!response.ok) { state.textContent = "HTTP " + response.status + " " + body.error; return; }
     for (const event of body.events) {
@@ -152,9 +155,10 @@ class MemoryStore:
         with self.lock:
             return self.events.get(event_id)
 
-    def latest(self, limit):
+    def latest(self, limit, device_id=None):
         with self.lock:
-            return list(self.events.values())[-limit:][::-1]
+            return [event for event in self.events.values()
+                    if device_id is None or event["device_id"] == device_id][-limit:][::-1]
 
 
 class PostgresStore:
@@ -217,10 +221,11 @@ class PostgresStore:
             return None if row is None else self.to_event(row)
         return self.run(work)
 
-    def latest(self, limit):
+    def latest(self, limit, device_id=None):
         def work(cursor):
-            cursor.execute("SELECT " + self.COLUMNS + " FROM events ORDER BY received_at DESC, event_id DESC LIMIT %s",
-                           (limit,))
+            # %s IS NULL keeps one fixed statement for both the full list and the per-device list.
+            cursor.execute("SELECT " + self.COLUMNS + " FROM events WHERE %s::text IS NULL OR device_id = %s "
+                           "ORDER BY received_at DESC, event_id DESC LIMIT %s", (device_id, device_id, limit))
             return [self.to_event(row) for row in cursor.fetchall()]
         return self.run(work)
 
@@ -314,7 +319,10 @@ def make_server(version_file, port=8080, tokens=None, store=None):
                     self.wfile.write(PAGE)
                 elif path == "/events":
                     self.require("operator")
-                    self.send_json(200, {"events": store.latest(LIST_LIMIT)})
+                    device_id = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get("device_id", [None])[-1]
+                    if device_id is not None and not (len(device_id) <= 32 and ID_PATTERN.fullmatch(device_id)):
+                        raise Rejected(400, "invalid_field", "device_id")
+                    self.send_json(200, {"events": store.latest(LIST_LIMIT, device_id)})
                 elif path.startswith("/events/"):
                     self.require("operator")
                     event = store.get(path[len("/events/"):])
